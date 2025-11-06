@@ -17,25 +17,43 @@ Options:
   --include-docker     Also prune Docker images/containers/volumes
   --include-snap       Remove old Snap revisions (if snap is installed)
   --include-flatpak    Remove unused Flatpak runtimes (if flatpak is installed)
-  --no-zero-fill       Skip zero-filling free space (for compacting you usually want it ON)
+  --no-zero-fill       Skip zero-filling (or fstrim) of free space
   -h, --help           Show this help
 USAGE
 }
 
+# Require root (script expects sudo/root)
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+  echo "Please run as root (e.g., sudo $0 ...)" >&2
+  exit 1
+fi
+
+# Detect invoking user's home when run via sudo (fallback to root)
+INVOKER_HOME="${HOME}"
+if [[ -n "${SUDO_USER:-}" ]] && [[ "${SUDO_USER}" != "root" ]]; then
+  INVOKER_HOME="$(getent passwd "${SUDO_USER}" | cut -d: -f6 || echo "/home/${SUDO_USER}")"
+fi
+
 # Parse flags
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --logs-days) LOG_DAYS="${2:-7}"; shift 2 ;;
+    --logs-days)
+      LOG_DAYS="${2:-7}"
+      [[ "${LOG_DAYS}" =~ ^[0-9]+$ ]] || { echo "ERROR: --logs-days expects an integer" >&2; exit 1; }
+      shift 2
+      ;;
     --include-docker) DOCKER_PRUNE=true; shift ;;
     --include-snap) SNAP_PRUNE=true; shift ;;
     --include-flatpak) FLATPAK_PRUNE=true; shift ;;
     --no-zero-fill) ZERO_FILL=false; shift ;;
     -h|--help) usage; exit 0 ;;
-    *) echo "Unknown option: $1"; usage; exit 1 ;;
+    *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
   esac
 done
 
 need_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+export DEBIAN_FRONTEND=noninteractive
 
 echo "=== VM Cleanup starting ==="
 echo "Keeping journal logs for: ${LOG_DAYS}d"
@@ -45,40 +63,44 @@ echo "Flatpak prune:${FLATPAK_PRUNE}"
 echo "Zero-fill:    ${ZERO_FILL}"
 echo
 
-echo "[1/11] Disk usage BEFORE:"
+echo "[1/12] Disk usage BEFORE:"
 df -h || true
 echo
 
-echo "[2/11] APT cleanup (clean, autoclean, autoremove --purge)…"
+echo "[2/12] APT cleanup (autoremove/autoclean/clean)…"
 apt-get -y update >/dev/null || true
 apt-get -y autoremove --purge || true
 apt-get -y autoclean || true
 apt-get -y clean || true
 
-echo "[3/11] Remove Chromium (packages + user cache) if present…"
+echo "[3/12] Remove Chromium (packages + user cache) if present…"
 apt-get -y remove --purge chromium chromium-common chromium-browser >/dev/null 2>&1 || true
-rm -rf "${HOME}/.config/chromium" "${HOME}/.cache/chromium" 2>/dev/null || true
+shopt -s nullglob
+rm -rf "${INVOKER_HOME}/.config/chromium" "${INVOKER_HOME}/.cache/chromium" 2>/dev/null || true
 
-echo "[4/11] Trim Brave cache (keeps your profile/bookmarks)…"
-rm -rf "${HOME}/.cache/BraveSoftware" 2>/dev/null || true
+echo "[4/12] Trim Brave cache (keeps profile/bookmarks)…"
+rm -rf "${INVOKER_HOME}/.cache/BraveSoftware/Brave-Browser/"* 2>/dev/null || true
 
-echo "[5/11] Clear /tmp and user caches…"
+echo "[5/12] Clear /tmp and user caches…"
 rm -rf /tmp/* 2>/dev/null || true
-rm -rf "${HOME}/.cache/"* 2>/dev/null || true
+rm -rf "${INVOKER_HOME}/.cache/"* 2>/dev/null || true
+shopt -u nullglob
 
-echo "[6/11] Journal and log rotation cleanup…"
+echo "[6/12] Journal and log rotation cleanup…"
 if need_cmd journalctl; then
   journalctl --vacuum-time="${LOG_DAYS}d" || true
 fi
-# Remove rotated/compressed logs and truncate current logs
-find /var/log -type f -name "*.gz" -delete 2>/dev/null || true
-find /var/log -type f -regextype posix-extended -regex '.*\.[0-9]+' -delete 2>/dev/null || true
-find /var/log -type f -name "*.log" -exec truncate -s 0 {} \; 2>/dev/null || true
+# Remove rotated/compressed logs and truncate common *.log, but keep some auth/last logs intact
+find /var/log -xdev -type f -name "*.gz" -delete 2>/dev/null || true
+find /var/log -xdev -type f -regextype posix-extended -regex '.*/.*\.[0-9]+' -delete 2>/dev/null || true
+find /var/log -xdev -type f -name "*.log" \
+  ! -name "lastlog" ! -name "wtmp" ! -name "btmp" \
+  -exec truncate -s 0 {} \; 2>/dev/null || true
 
-echo "[7/11] Clean apt list residue (will re-generate on next apt update)…"
+echo "[7/12] Clean apt list residue (will re-generate on next apt update)…"
 rm -rf /var/lib/apt/lists/* 2>/dev/null || true
 
-echo "[8/11] Optional ecosystem cleanup…"
+echo "[8/12] Optional ecosystem cleanup…"
 if ${DOCKER_PRUNE} && need_cmd docker; then
   echo "  • Docker system prune -a --volumes"
   docker system prune -a --volumes -f || true
@@ -88,7 +110,7 @@ fi
 
 if ${SNAP_PRUNE} && need_cmd snap; then
   echo "  • Snap old revision cleanup"
-  snap list --all | awk '/disabled/{print $1, $3}' | while read snapname revision; do
+  snap list --all 2>/dev/null | awk '/disabled/{print $1, $3}' | while read -r snapname revision; do
     snap remove "$snapname" --revision="$revision" || true
   done
 else
@@ -102,33 +124,38 @@ else
   echo "  • Flatpak prune skipped (use --include-flatpak to enable)."
 fi
 
-echo "[9/11] Try removing some heavy optional desktop apps (quietly, if installed)…"
+echo "[9/12] Try removing some heavy optional desktop apps (quietly, if installed)…"
 apt-get -y remove --purge libreoffice* thunderbird* hexchat* gimp* >/dev/null 2>&1 || true
 
-echo "[10/11] Final autoremove/clean sweep…"
+echo "[10/12] Final autoremove/clean sweep…"
 apt-get -y autoremove --purge || true
 apt-get -y autoclean || true
 apt-get -y clean || true
 
-echo "[11/11] Disk usage AFTER cleanup (before zero-fill):"
+echo "[11/12] Disk usage AFTER cleanup (pre-trim/zero-fill):"
 df -h || true
 echo
 
 if ${ZERO_FILL}; then
-  echo "Zero-filling free space to help compact the disk…"
-  echo "This will temporarily fill the disk; that's expected."
-  sync
-  dd if=/dev/zero of=/EMPTY bs=1M status=progress || true
-  sync
-  rm -f /EMPTY || true
-  sync
-  echo "Zero-fill complete."
+  if need_cmd fstrim; then
+    echo "Running fstrim -av (preferred on SSD/VM backends)…"
+    fstrim -av || true
+  else
+    echo "Zero-filling free space to help compact the disk…"
+    echo "This will temporarily fill the disk; that's expected."
+    sync
+    dd if=/dev/zero of=/EMPTY bs=1M status=progress || true
+    sync
+    rm -f /EMPTY || true
+    sync
+    echo "Zero-fill complete."
+  fi
 else
-  echo "Skipped zero-fill (--no-zero-fill)."
+  echo "Skipped fstrim/zero-fill (--no-zero-fill)."
 fi
 
 echo
-echo "Disk usage AFTER zero-fill (file removed):"
+echo "[12/12] Disk usage AFTER trim/zero-fill:"
 df -h || true
 echo
 echo "=== Cleanup finished ==="
